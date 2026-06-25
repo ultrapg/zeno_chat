@@ -124,35 +124,35 @@ The application does **not** run its own inference engine. Instead, it shells ou
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                       Zeno Chat (Rust)                       │
+│                       Zeno Chat (Rust)                      │
 │                                                             │
 │  ┌──────────────┐            ┌───────────────────────────┐  │
-│  │  config.json  │◄──────────►│      Main Loop           │  │
+│  │  config.json │◄──────────►│      Main Loop            │  │
 │  └──────────────┘            │  - Turn counter           │  │
-│                               │  - Agent A → Agent B     │  │
+│                              │  - Agent A → Agent B      │  │
 │  ┌──────────────┐            │  - Limit checking         │  │
-│  │  History A    │◄──────────►│  - Logging               │  │
+│  │  History A   │◄──────────►│  - Logging                │  │
 │  └──────────────┘            └───────────┬───────────────┘  │
 │  ┌──────────────┐                        │                  │
-│  │  History B    │◄──────────►┌──────────▼───────────────┐  │
-│  └──────────────┘             │     Per-Turn Actions      │  │
-│                                │  - Format prompt         │  │
+│  │  History B   │◄──────────►┌──────────▼────────────────┐  │
+│  └──────────────┘            │     Per-Turn Actions      │  │
+│                              │  - Format prompt          │  │
 │  ┌──────────────┐            │  - Spawn llama-completion │  │
-│  │  Summaries    │◄──────────►│  - Stream display        │  │
+│  │  Summaries   │◄──────────►│  - Stream display         │  │
 │  └──────────────┘            │  - Parse stats from stderr│  │
-│                               │  - Compress if needed    │  │
-│                               └───────────┬───────────────┘  │
-│                                           │                  │
-└───────────────────────────────────────────┼──────────────────┘
-                                            │
-                     ┌──────────────────────▼──────────────────┐
-                     │         llama-completion.exe             │
-                     │  (llama.cpp subprocess, Vulkan or CPU)   │
-                     │                                          │
-                     │  stdin:  prompt text                     │
-                     │  stdout: generated tokens (streamed)     │
-                     │  stderr: performance statistics           │
-                     └──────────────────────────────────────────┘
+│                              │  - Compress if needed     │  │
+│                              └───────────┬───────────────┘  │
+│                                          │                  │
+└──────────────────────────────────────────┼──────────────────┘
+                                           │
+                    ┌──────────────────────▼───────────────────┐
+                    │         llama-completion.exe             │
+                    │  (llama.cpp subprocess, Vulkan or CPU)   │
+                    │                                          │
+                    │  stdin:  prompt text                     │
+                    │  stdout: generated tokens (streamed)     │
+                    │  stderr: performance statistics          │
+                    └──────────────────────────────────────────┘
 ```
 
 ### Component Breakdown
