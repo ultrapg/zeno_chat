@@ -1,0 +1,38 @@
+{
+  "selected_model": "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+
+  "agent_name_a": "Agent A",
+  "agent_name_b": "Agent B",
+  "system_prompt_a": "You are Agent A. You are having a conversation with Agent B. Keep your responses short.",
+  "system_prompt_b": "You are Agent B. You are having a conversation with Agent A. Keep your responses short.",
+  "start_prompt": "Agent A: Hello! What shall we talk about today?",
+
+  "limit": "20",
+
+  "agent_color_a": "DarkYellow",
+  "agent_color_b": "Blue",
+  "header_color": "DarkGrey",
+  "stats_color": "Grey",
+  "thinking_color": "DarkGrey",
+
+  "log_file": "chat_log.jsonl",
+  "log_mode": "json",
+  "show_stats": true,
+  "log_stats": false,
+  "show_thinking": false,
+  "log_thinking": false,
+  "log_debug": false,
+
+  "compress_threshold": 30,
+  "compress_keep": 20,
+
+  "models": {
+    "Llama-3.2-1B-Instruct-Q4_K_M.gguf": {
+      "ctx": 4096,
+      "temp": 0.8,
+      "n_predict": 512,
+      "n_gpu_layers_override": null,
+      "reasoning": "auto"
+    }
+  }
+}

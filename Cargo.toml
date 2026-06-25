@@ -1,0 +1,15 @@
+[package]
+name = "zeno_chat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+reqwest = { version = "0.11", features = ["blocking", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+zip = "0.6"
+indicatif = "0.17"
+crossterm = "0.27"
+anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
+time = { version = "0.3", features = ["local-offset"] }
