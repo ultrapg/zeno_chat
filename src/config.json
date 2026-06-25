@@ -26,6 +26,8 @@
   "compress_threshold": 30,
   "compress_keep": 20,
 
+  "repeat_limit": 5,
+
   "models": {
     "Llama-3.2-1B-Instruct-Q4_K_M.gguf": {
       "ctx": 4096,

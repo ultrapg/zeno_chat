@@ -40,6 +40,7 @@ fn default_log_thinking()    -> bool   { false }
 fn default_log_debug()       -> bool   { false }
 fn default_compress_thresh() -> usize  { 30 }
 fn default_compress_keep()   -> usize  { 20 }
+fn default_repeat_limit()    -> usize  { 5 }
 
 // ─── MODEL PARAMS ────────────────────────────────────────────────────────────
 
@@ -84,17 +85,21 @@ struct AppConfig {
     #[serde(default = "default_thinking_color")] thinking_color: String,
 
     // Logging
-    #[serde(default = "default_log_file")]    log_file:     String,
-    #[serde(default = "default_log_mode")]    log_mode:     String, // "json" or "txt"
-    #[serde(default = "default_show_stats")]  show_stats:   bool,
-    #[serde(default = "default_log_stats")]   log_stats:    bool,
+    #[serde(default = "default_log_file")]     log_file:     String,
+    #[serde(default = "default_log_mode")]     log_mode:     String, // "json" or "txt"
+    #[serde(default = "default_show_stats")]   show_stats:   bool,
+    #[serde(default = "default_log_stats")]    log_stats:    bool,
     #[serde(default = "default_show_thinking")] show_thinking: bool,
     #[serde(default = "default_log_thinking")] log_thinking: bool,
-    #[serde(default = "default_log_debug")]   log_debug:    bool,
+    #[serde(default = "default_log_debug")]    log_debug:    bool,
 
     // Context compression
     #[serde(default = "default_compress_thresh")] compress_threshold: usize,
     #[serde(default = "default_compress_keep")]   compress_keep:      usize,
+
+    // Generation safety: stop if the last N tokens are all identical.
+    // Set to 0 to disable. Default: 5.
+    #[serde(default = "default_repeat_limit")] repeat_limit: usize,
 
     models: std::collections::HashMap<String, ModelParams>,
 }
@@ -125,6 +130,7 @@ impl Default for AppConfig {
             log_debug:       default_log_debug(),
             compress_threshold: default_compress_thresh(),
             compress_keep:      default_compress_keep(),
+            repeat_limit:       default_repeat_limit(),
             models,
         }
     }
@@ -215,7 +221,7 @@ fn append_to_log(
         writeln!(file, "[{}] {}: {}", timestamp, speaker, text)?;
         if let Some(t) = thinking { writeln!(file, "  <thinking> {}", t)?; }
         if let Some(s) = stats    { writeln!(file, "  [stats] {}",    s)?; }
-        if let Some(d) = debug    { writeln!(file, "  [debug]\n{}",   d)?; }
+        if let Some(d) = debug    { writeln!(file, "  [debug]\n{}", d)?; }
     } else {
         let entry = ChatLogEntry { timestamp, speaker: speaker.to_string(), text: text.to_string(), thinking, stats, debug };
         writeln!(file, "{}", serde_json::to_string(&entry)?)?;
@@ -332,16 +338,17 @@ fn format_prompt(sys: &str, summary: Option<&str>, history: &[Message]) -> Strin
 struct DetailedStats {
     eval_time_ms: f32, eval_tokens: usize, eval_speed: f32,
     gen_time_ms: f32,  gen_tokens: usize,  gen_speed: f32,
-    sampling_time_ms: f32, sampling_runs: usize, sampling_speed: f32,
     load_time_ms: f32, total_time_ms: f32,
+    /// Tokens used in context window (eval + gen); set externally if available.
+    context_used: usize,
 }
 
 fn parse_detailed_stats(log: &str) -> Option<DetailedStats> {
     let mut s = DetailedStats {
         eval_time_ms: 0.0, eval_tokens: 0, eval_speed: 0.0,
         gen_time_ms: 0.0,  gen_tokens: 0,  gen_speed: 0.0,
-        sampling_time_ms: 0.0, sampling_runs: 0, sampling_speed: 0.0,
         load_time_ms: 0.0, total_time_ms: 0.0,
+        context_used: 0,
     };
     let pv = |line: &str, label: &str, end: &str| -> Option<f32> {
         let pos = line.find(label)?;
@@ -356,45 +363,24 @@ fn parse_detailed_stats(log: &str) -> Option<DetailedStats> {
             if let Some(v) = pv(line, "eval time =", "ms") { s.gen_time_ms = v; }
             if let Some(v) = pv(line, "/", "runs")          { s.gen_tokens  = v as usize; }
             if let Some(v) = pv(line, ",", "tokens per second") { s.gen_speed = v; }
-        } else if line.contains("sample time") {
-            if let Some(v) = pv(line, "sample time =", "ms") { s.sampling_time_ms  = v; }
-            if let Some(v) = pv(line, "/", "runs")            { s.sampling_runs     = v as usize; }
-            if let Some(v) = pv(line, ",", "tokens per second") { s.sampling_speed  = v; }
         } else if line.contains("load time")  { if let Some(v) = pv(line, "load time =", "ms")  { s.load_time_ms  = v; } }
           else if line.contains("total time") { if let Some(v) = pv(line, "total time =", "ms") { s.total_time_ms = v; } }
     }
+    // context_used = prompt tokens evaluated + tokens generated
+    s.context_used = s.eval_tokens + s.gen_tokens;
     Some(s)
 }
 
-fn format_stats(s: &DetailedStats) -> String {
+/// Format the stats line.
+/// Template: eval Xt/s (Yms/Zt) | gen Xt/s (Yms/Zt) | ctx USED/MAX | load Xms | total Xms
+fn format_stats(s: &DetailedStats, ctx_max: usize) -> String {
     format!(
-        "eval {:.1}t/s ({:.0}ms/{et}t) | gen {:.1}t/s ({:.0}ms/{gt}t) | samp {:.1}t/s ({:.0}ms/{sr}r) | load {:.0}ms | total {:.0}ms",
+        "eval {:.1}t/s ({:.0}ms/{et}t) | gen {:.1}t/s ({:.0}ms/{gt}t) | ctx {cu}/{cm} | load {:.0}ms | total {:.0}ms",
         s.eval_speed, s.eval_time_ms, s.gen_speed, s.gen_time_ms,
-        s.sampling_speed, s.sampling_time_ms, s.load_time_ms, s.total_time_ms,
-        et = s.eval_tokens, gt = s.gen_tokens, sr = s.sampling_runs
+        s.load_time_ms, s.total_time_ms,
+        et = s.eval_tokens, gt = s.gen_tokens,
+        cu = s.context_used, cm = ctx_max,
     )
-}
-
-// ─── THINK TAG SPLITTER ──────────────────────────────────────────────────────
-
-/// Splits the raw LLM output into (normal_text, thinking_text), stripping the tags.
-#[allow(dead_code)]
-fn split_thinking(raw: &str) -> (String, String) {
-    let mut normal = String::new();
-    let mut think  = String::new();
-    let mut in_think = false;
-    let mut i = 0;
-    while i < raw.len() {
-        let rem = &raw[i..];
-        if !in_think && rem.starts_with("<think>") { in_think = true;  i += 7; }
-        else if in_think && rem.starts_with("</think>") { in_think = false; i += 8; }
-        else {
-            let ch = rem.chars().next().unwrap();
-            if in_think { think.push(ch); } else { normal.push(ch); }
-            i += ch.len_utf8();
-        }
-    }
-    (normal.trim().to_string(), think.trim().to_string())
 }
 
 // ─── STREAM DISPLAY ──────────────────────────────────────────────────────────
@@ -406,6 +392,7 @@ const EOT_PATTERNS: &[&str] = &[" [end of text]", "[end of text]", "<|eot_id|>"]
 /// - Think tag detection (colorised or hidden based on config)
 /// - Trailing newline suppression (no blank lines before stats)
 /// - Mid-stream double blank line cap (max 1 blank line inside a message)
+/// - Repeat-limit detection: stops emission when the same token repeats too many times
 struct StreamDisplay {
     // EOT filtering
     eot_buf: Vec<char>,
@@ -415,35 +402,50 @@ struct StreamDisplay {
     // Trailing newline suppression
     pending_nl: usize,
     // Config
-    msg_color:     Color,
+    msg_color:      Color,
     thinking_color: Color,
-    show_thinking: bool,
+    show_thinking:  bool,
     // Output accumulation (separated)
     pub normal_buf: String,
     pub think_buf:  String,
+    // Repeat-limit detection (n-gram sliding window)
+    repeat_limit:        usize,
+    pub repeat_exceeded: bool,
+    /// Rolling list of non-empty words seen so far (normal content only).
+    word_history:        Vec<String>,
+    /// Current word being accumulated (chars since last whitespace boundary).
+    current_word:        String,
 }
 
 impl StreamDisplay {
-    fn new(msg_color: Color, thinking_color: Color, show_thinking: bool) -> Self {
+    fn new(msg_color: Color, thinking_color: Color, show_thinking: bool, repeat_limit: usize) -> Self {
         let _ = execute!(std::io::stdout(), SetForegroundColor(msg_color));
         let _ = std::io::stdout().flush();
         Self {
             eot_buf: Vec::new(), tag_buf: String::new(), in_think: false,
             pending_nl: 0, msg_color, thinking_color, show_thinking,
             normal_buf: String::new(), think_buf: String::new(),
+            repeat_limit,
+            repeat_exceeded: false,
+            word_history: Vec::new(),
+            current_word: String::new(),
         }
     }
 
     /// Feed one character from the raw LLM output.
-    fn push(&mut self, ch: char) {
+    /// Returns false if the repeat limit was exceeded and generation should stop.
+    fn push(&mut self, ch: char) -> bool {
+        if self.repeat_exceeded { return false; }
+
         // Stage 1: EOT filtering
         self.eot_buf.push(ch);
         let qs: String = self.eot_buf.iter().collect();
-        if EOT_PATTERNS.iter().any(|p| **p == qs) { self.eot_buf.clear(); return; }
-        if EOT_PATTERNS.iter().any(|p| p.starts_with(qs.as_str()) && qs.len() < p.len()) { return; }
+        if EOT_PATTERNS.iter().any(|p| **p == qs) { self.eot_buf.clear(); return true; }
+        if EOT_PATTERNS.iter().any(|p| p.starts_with(qs.as_str()) && qs.len() < p.len()) { return true; }
         // Mismatch: flush eot_buf through stage 2
         let chars: Vec<char> = self.eot_buf.drain(..).collect();
         for c in chars { self.think_stage(c); }
+        true
     }
 
     fn think_stage(&mut self, ch: char) {
@@ -487,6 +489,55 @@ impl StreamDisplay {
     }
 
     fn emit_normal(&mut self, ch: char) {
+        // ── Repeat-limit: n-gram sliding window ──────────────────────────────
+        // At every word boundary we check whether any n-gram of length 1..=MAX_NGRAM
+        // appears `repeat_limit` times consecutively at the tail of word_history.
+        // This catches single-word loops AND repeating phrases / sentences.
+        const MAX_NGRAM: usize = 50;
+
+        let is_boundary = ch == ' ' || ch == '\n' || ch == '\r';
+        if self.repeat_limit > 0 && is_boundary {
+            let w = std::mem::take(&mut self.current_word);
+            if !w.is_empty() {
+                self.word_history.push(w);
+                let h = &self.word_history;
+                let n = h.len();
+                // Check every n-gram length from 1 up to MAX_NGRAM
+                'outer: for gram_len in 1..=MAX_NGRAM {
+                    // We need at least repeat_limit * gram_len words in history
+                    let needed = gram_len * self.repeat_limit;
+                    if n < needed { continue; }
+                    // The candidate pattern is the last gram_len words
+                    let pattern = &h[n - gram_len..];
+                    // Check that the previous (repeat_limit - 1) occurrences match
+                    let mut all_match = true;
+                    for rep in 1..self.repeat_limit {
+                        let end   = n - gram_len * rep;
+                        let start = end - gram_len;
+                        if &h[start..end] != pattern {
+                            all_match = false;
+                            break;
+                        }
+                    }
+                    if all_match {
+                        self.repeat_exceeded = true;
+                        let _ = execute!(std::io::stdout(), ResetColor);
+                        let _ = std::io::stdout().flush();
+                        break 'outer;
+                    }
+                }
+                // Trim history to avoid unbounded growth: keep last MAX_NGRAM * repeat_limit words
+                let max_history = MAX_NGRAM * self.repeat_limit;
+                if self.word_history.len() > max_history {
+                    let drain = self.word_history.len() - max_history;
+                    self.word_history.drain(..drain);
+                }
+                if self.repeat_exceeded { return; }
+            }
+        } else if !is_boundary && self.repeat_limit > 0 {
+            self.current_word.push(ch);
+        }
+
         if ch == '\n' {
             self.pending_nl += 1;
         } else {
@@ -530,18 +581,19 @@ impl StreamDisplay {
 
 #[allow(clippy::too_many_arguments)]
 fn run_and_stream(
-    binary_path:   &str,
-    model_path:    &str,
-    prompt:        &str,
-    auto_ngl:      usize,
-    msg_color:     Color,
-    header_color:  Color,
-    stats_color:   Color,
-    speaker:       &str,
-    params:        &ModelParams,
-    show_stats:    bool,
-    show_thinking: bool,
+    binary_path:    &str,
+    model_path:     &str,
+    prompt:         &str,
+    auto_ngl:       usize,
+    msg_color:      Color,
+    header_color:   Color,
+    stats_color:    Color,
+    speaker:        &str,
+    params:         &ModelParams,
+    show_stats:     bool,
+    show_thinking:  bool,
     thinking_color: Color,
+    repeat_limit:   usize,
 ) -> Result<(String, String, Option<DetailedStats>, String)> {
     // Returns: (normal_response, think_content, stats, stderr_debug)
     let mut stdout = std::io::stdout();
@@ -577,11 +629,11 @@ fn run_and_stream(
         if proc_stderr.read_to_string(&mut buf).is_ok() { let _ = tx.send(buf); }
     });
 
-    let mut display = StreamDisplay::new(msg_color, thinking_color, show_thinking);
+    let mut display = StreamDisplay::new(msg_color, thinking_color, show_thinking, repeat_limit);
     let mut byte_buf: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 1024];
 
-    loop {
+    'read: loop {
         let n = proc_stdout.read(&mut tmp)?;
         if n == 0 { break; }
         byte_buf.extend_from_slice(&tmp[..n]);
@@ -595,23 +647,38 @@ fn run_and_stream(
                     byte_buf.drain(..up); s
                 }
             };
-            for ch in s.chars() { display.push(ch); }
+            for ch in s.chars() {
+                if !display.push(ch) {
+                    // repeat_limit exceeded — kill child and exit
+                    let _ = child.kill();
+                    break 'read;
+                }
+            }
             let _ = std::io::stdout().flush();
         }
     }
     display.finish();
 
-    let _ = child.wait()?;
+    let _ = child.wait();
     let stderr_log = rx.recv().unwrap_or_default();
     let stats = parse_detailed_stats(&stderr_log);
 
-    // Print stats immediately after message (no blank line between)
+    // Print stats immediately after message (no blank line between message and stats)
     if show_stats {
         if let Some(ref s) = stats {
-            let _ = execute!(stdout, SetForegroundColor(stats_color), Print(format!("[{}]\n", format_stats(s))), ResetColor);
+            let stats_str = format_stats(s, params.ctx);
+            let _ = execute!(stdout, SetForegroundColor(stats_color), Print(format!("[{}]\n", stats_str)), ResetColor);
         }
     }
-    // Blank line to separate entries
+
+    if display.repeat_exceeded {
+        let _ = execute!(stdout,
+            SetForegroundColor(Color::DarkRed),
+            Print("[Generation stopped: repeat limit exceeded]\n"),
+            ResetColor);
+    }
+
+    // Blank separator line between turns
     println!();
 
     Ok((display.normal_buf.trim().to_string(), display.think_buf.trim().to_string(), stats, stderr_log))
@@ -666,42 +733,58 @@ fn clean_response(text: &str) -> String {
 fn main() -> Result<()> {
     let _args = Args::parse();
     let base = std::env::current_exe()?.parent().context("no exe dir")?.to_path_buf();
-    let exe_config_path = base.join("config.json");
-// Determine which config to load: exe dir first, then src dir, else use embedded default.
-let src_config_path = base.join("src").join("config.json");
-let mut config: AppConfig = if exe_config_path.exists() {
-    // Load from exe directory
-    match std::fs::read_to_string(&exe_config_path)
-        .and_then(|s| serde_json::from_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))) {
-        Ok(c) => c,
-        Err(e) => { println!("[Warning: config error in exe config: {}. Using defaults.]", e); AppConfig::default() }
-    }
-} else if src_config_path.exists() {
-    // Load from src directory (fallback)
-    match std::fs::read_to_string(&src_config_path)
-        .and_then(|s| serde_json::from_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))) {
-        Ok(c) => c,
-        Err(e) => { println!("[Warning: config error in src config: {}. Using defaults.]", e); AppConfig::default() }
-    }
-} else {
-    // Use embedded default config
-    let default_str = include_str!("default_config.json");
-    match serde_json::from_str(default_str) {
-        Ok(c) => c,
-        Err(e) => { println!("[Warning: embedded config error: {}. Using defaults.]", e); AppConfig::default() }
-    }
-};
 
-// Ensure a config file exists in the exe directory for future runs
-if !exe_config_path.exists() {
-    if let Ok(s) = serde_json::to_string_pretty(&config) {
-        let _ = std::fs::write(&exe_config_path, s);
-    }
-}
+    // ── Configuration ────────────────────────────────────────────────────────────
+    //
+    // Search order:
+    //   1. <exe_dir>/src/config.json  (development — project source layout)
+    //   2. <exe_dir>/config.json      (standalone deployment — user-editable)
+    //   3. Write a fresh config.json next to the exe, then use defaults.
+    //
+    // Config is NEVER overwritten once it exists.
+    let src_config = base.join("src").join("config.json");
+    let exe_config = base.join("config.json");
 
-    let model_params = config.models.entry(config.selected_model.clone()).or_insert_with(ModelParams::default).clone();
-    // Persist config back (adds any new fields with defaults)
-    if let Ok(s) = serde_json::to_string_pretty(&config) { let _ = std::fs::write(&exe_config_path, s); }
+    let config: AppConfig = if src_config.exists() {
+        match std::fs::read_to_string(&src_config)
+            .map_err(|e| e.to_string())
+            .and_then(|s| serde_json::from_str::<AppConfig>(&s).map_err(|e| e.to_string()))
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[Warning] src/config.json parse error: {}. Using defaults.", e);
+                AppConfig::default()
+            }
+        }
+    } else if exe_config.exists() {
+        match std::fs::read_to_string(&exe_config)
+            .map_err(|e| e.to_string())
+            .and_then(|s| serde_json::from_str::<AppConfig>(&s).map_err(|e| e.to_string()))
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[Warning] config.json parse error: {}. Using defaults.", e);
+                AppConfig::default()
+            }
+        }
+    } else {
+        // First run with no config file present — write a default config.json
+        // next to the exe so the user can edit it, then continue with defaults.
+        let defaults = AppConfig::default();
+        match serde_json::to_string_pretty(&defaults) {
+            Ok(s) => {
+                match std::fs::write(&exe_config, &s) {
+                    Ok(_) => eprintln!("[Info] Created default config.json at {}", exe_config.display()),
+                    Err(e) => eprintln!("[Warning] Could not write config.json: {}", e),
+                }
+            }
+            Err(e) => eprintln!("[Warning] Could not serialise default config: {}", e),
+        }
+        defaults
+    };
+
+
+    let model_params = config.models.get(&config.selected_model).cloned().unwrap_or_default();
 
     let client = reqwest::blocking::Client::builder().user_agent("zeno-chat-cli").build()?;
     let (binary_path, auto_ngl) = setup(&client, &config.selected_model)?;
@@ -710,11 +793,11 @@ if !exe_config_path.exists() {
     let log_file_path  = base.join(&config.log_file);
 
     // Parse colors once
-    let color_a       = parse_color(&config.agent_color_a);
-    let color_b       = parse_color(&config.agent_color_b);
-    let header_color  = parse_color(&config.header_color);
-    let stats_color   = parse_color(&config.stats_color);
-    let think_color   = parse_color(&config.thinking_color);
+    let color_a      = parse_color(&config.agent_color_a);
+    let color_b      = parse_color(&config.agent_color_b);
+    let header_color = parse_color(&config.header_color);
+    let stats_color  = parse_color(&config.stats_color);
+    let think_color  = parse_color(&config.thinking_color);
 
     let limit_str = config.limit.clone();
     let limit: Option<usize> = match limit_str.to_lowercase().trim() {
@@ -748,12 +831,13 @@ if !exe_config_path.exists() {
             &binary_path, &model_path_str, &prompt_a, auto_ngl,
             color_a, header_color, stats_color, &config.agent_name_a,
             &model_params, config.show_stats, config.show_thinking, think_color,
+            config.repeat_limit,
         )?;
         let resp_a_clean = clean_response(&resp_a);
         history_a.push(Message { role: Role::Assistant, content: resp_a_clean.clone() });
         history_b.push(Message { role: Role::User,      content: resp_a_clean.clone() });
 
-        let stats_str_a = if config.log_stats { stats_a.as_ref().map(format_stats) } else { None };
+        let stats_str_a = if config.log_stats { stats_a.as_ref().map(|s| format_stats(s, model_params.ctx)) } else { None };
         let _ = append_to_log(
             &log_file_path, &config.agent_name_a, &resp_a_clean,
             if config.log_thinking && !think_a.is_empty() { Some(&think_a) } else { None },
@@ -776,12 +860,13 @@ if !exe_config_path.exists() {
             &binary_path, &model_path_str, &prompt_b, auto_ngl,
             color_b, header_color, stats_color, &config.agent_name_b,
             &model_params, config.show_stats, config.show_thinking, think_color,
+            config.repeat_limit,
         )?;
         let resp_b_clean = clean_response(&resp_b);
         history_a.push(Message { role: Role::User,      content: resp_b_clean.clone() });
         history_b.push(Message { role: Role::Assistant, content: resp_b_clean.clone() });
 
-        let stats_str_b = if config.log_stats { stats_b.as_ref().map(format_stats) } else { None };
+        let stats_str_b = if config.log_stats { stats_b.as_ref().map(|s| format_stats(s, model_params.ctx)) } else { None };
         let _ = append_to_log(
             &log_file_path, &config.agent_name_b, &resp_b_clean,
             if config.log_thinking && !think_b.is_empty() { Some(&think_b) } else { None },
