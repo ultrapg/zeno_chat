@@ -665,26 +665,43 @@ fn clean_response(text: &str) -> String {
 
 fn main() -> Result<()> {
     let _args = Args::parse();
-    let base         = std::env::current_exe()?.parent().context("no exe dir")?.to_path_buf();
-    // Load configuration from src/config.json instead of embedding it in the executable directory.
-    let config_path  = base.join("src").join("config.json");
+    let base = std::env::current_exe()?.parent().context("no exe dir")?.to_path_buf();
+    let exe_config_path = base.join("config.json");
+// Determine which config to load: exe dir first, then src dir, else use embedded default.
+let src_config_path = base.join("src").join("config.json");
+let mut config: AppConfig = if exe_config_path.exists() {
+    // Load from exe directory
+    match std::fs::read_to_string(&exe_config_path)
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))) {
+        Ok(c) => c,
+        Err(e) => { println!("[Warning: config error in exe config: {}. Using defaults.]", e); AppConfig::default() }
+    }
+} else if src_config_path.exists() {
+    // Load from src directory (fallback)
+    match std::fs::read_to_string(&src_config_path)
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))) {
+        Ok(c) => c,
+        Err(e) => { println!("[Warning: config error in src config: {}. Using defaults.]", e); AppConfig::default() }
+    }
+} else {
+    // Use embedded default config
+    let default_str = include_str!("default_config.json");
+    match serde_json::from_str(default_str) {
+        Ok(c) => c,
+        Err(e) => { println!("[Warning: embedded config error: {}. Using defaults.]", e); AppConfig::default() }
+    }
+};
 
-    let mut config: AppConfig = if config_path.exists() {
-        match std::fs::read_to_string(&config_path).map_err(|e| e.to_string())
-            .and_then(|s| serde_json::from_str::<AppConfig>(&s).map_err(|e| e.to_string()))
-        {
-            Ok(c) => c,
-            Err(e) => { println!("[Warning: config error: {}. Using defaults.]", e); AppConfig::default() }
-        }
-    } else {
-        let d = AppConfig::default();
-        if let Ok(s) = serde_json::to_string_pretty(&d) { let _ = std::fs::write(&config_path, &s); }
-        d
-    };
+// Ensure a config file exists in the exe directory for future runs
+if !exe_config_path.exists() {
+    if let Ok(s) = serde_json::to_string_pretty(&config) {
+        let _ = std::fs::write(&exe_config_path, s);
+    }
+}
 
     let model_params = config.models.entry(config.selected_model.clone()).or_insert_with(ModelParams::default).clone();
     // Persist config back (adds any new fields with defaults)
-    if let Ok(s) = serde_json::to_string_pretty(&config) { let _ = std::fs::write(&config_path, s); }
+    if let Ok(s) = serde_json::to_string_pretty(&config) { let _ = std::fs::write(&exe_config_path, s); }
 
     let client = reqwest::blocking::Client::builder().user_agent("zeno-chat-cli").build()?;
     let (binary_path, auto_ngl) = setup(&client, &config.selected_model)?;
